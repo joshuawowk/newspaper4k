@@ -18,6 +18,12 @@ USAGE EXAMPLES:
     # Search for specific keyword
     python stealth_scraper.py --minimized --search "fire" --max-articles 10
     
+    # Scrape a specific article URL
+    python stealth_scraper.py --minimized --url "https://www.nrinow.news/2025/..."
+    
+    # Save each article as separate files in a custom directory
+    python stealth_scraper.py --minimized --search "newberry" --separate-files --output-dir "articles/"
+    
     # Visible browser window
     python stealth_scraper.py --max-articles 3
     
@@ -50,6 +56,39 @@ from typing import List, Dict, Optional
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def parse_publish_date(date_string: str) -> Optional[str]:
+    """Parse publish date string and return YYYYMMDD format"""
+    if not date_string or date_string.lower() in ['unknown', 'n/a']:
+        return None
+        
+    try:
+        # Common date formats from NRI NOW
+        from datetime import datetime
+        
+        # Try different date formats
+        formats = [
+            "%B %d, %Y",        # "March 20, 2025"
+            "%b %d, %Y",        # "Mar 20, 2025"
+            "%Y-%m-%d",         # "2025-03-20"
+            "%m/%d/%Y",         # "03/20/2025"
+            "%d/%m/%Y",         # "20/03/2025"
+            "%B %d %Y",         # "March 20 2025"
+            "%b %d %Y",         # "Mar 20 2025"
+        ]
+        
+        for fmt in formats:
+            try:
+                parsed_date = datetime.strptime(date_string.strip(), fmt)
+                return parsed_date.strftime("%Y%m%d")
+            except ValueError:
+                continue
+                
+    except Exception as e:
+        logger.debug(f"Error parsing date '{date_string}': {e}")
+        
+    return None
 
 
 class StealthScraper:
@@ -323,86 +362,138 @@ class StealthScraper:
         return ""
     
     def _extract_comments(self, soup: BeautifulSoup) -> List[Dict]:
-        """Extract comments from the article"""
+        """Extract comments from the article using NRI NOW specific structure"""
         comments = []
         
-        # First try to get comment count from page metadata
+        # First try to get comment count from the comment section header
         comment_count = self._get_comment_count(soup)
         
-        # If no comments according to metadata, still try to find any
-        if comment_count == 0:
-            comments.append({
-                'text': f'No comments yet (Comment count: {comment_count})',
+        # Look for the main comments container
+        comments_section = soup.find('div', {'class': 'comments', 'id': 'comments'})
+        if not comments_section:
+            return [{
+                'text': f'No comments section found (Comment count: {comment_count})',
                 'author': 'System',
                 'date': 'N/A',
                 'length': 0,
                 'type': 'metadata'
-            })
+            }]
         
-        # Common comment selectors for WordPress and other CMS
-        comment_selectors = [
-            '#comments .comment-content',
-            '.comment-list .comment',
-            '.comments-area .comment',
-            '.comment-body',
-            '.comment-text',
-            '[id*="comment-"]',
-            '.wp-comment-text'
-        ]
+        # Find the comment list
+        comment_list = comments_section.find('ol', class_='comment-list')
+        if not comment_list:
+            return [{
+                'text': f'No comment list found (Comment count: {comment_count})',
+                'author': 'System', 
+                'date': 'N/A',
+                'length': 0,
+                'type': 'metadata'
+            }]
         
-        for selector in comment_selectors:
-            comment_elements = soup.select(selector)
-            
-            for comment_elem in comment_elements:
-                try:
-                    # Extract comment text
-                    comment_text = self._extract_comment_text(comment_elem)
-                    if not comment_text or len(comment_text.strip()) < 10:
-                        continue
-                    
-                    # Skip form elements and replies
-                    if any(skip in comment_text.lower() for skip in [
-                        'leave a reply', 'cancel reply', 'comment:', 'your email'
-                    ]):
-                        continue
-                    
-                    # Extract author
-                    author = self._extract_comment_author(comment_elem)
-                    
-                    # Extract date
-                    date = self._extract_comment_date(comment_elem)
-                    
-                    # Avoid duplicates
-                    comment_data = {
-                        'text': comment_text,
-                        'author': author,
-                        'date': date,
-                        'length': len(comment_text),
-                        'type': 'user_comment'
-                    }
-                    
-                    # Check if this comment is already in our list
-                    if not any(c['text'] == comment_text for c in comments):
-                        comments.append(comment_data)
-                        
-                except Exception as e:
-                    logger.debug(f"Error extracting comment: {e}")
+        # Extract individual comments (including replies)
+        comment_items = comment_list.find_all('li', class_='comment', recursive=True)
+        
+        for comment_item in comment_items:
+            try:
+                # Extract comment ID from the id attribute
+                comment_id = comment_item.get('id', '').replace('comment-', '')
+                
+                # Find the article element containing the comment
+                article = comment_item.find('article')
+                if not article:
                     continue
-            
-            # If we found comments with this selector, don't try others
-            if len([c for c in comments if c['type'] == 'user_comment']) > 0:
-                break
+                
+                # Extract author from cite element
+                author_elem = article.find('cite')
+                author = author_elem.get_text(strip=True) if author_elem else "Anonymous"
+                
+                # Extract date from time element
+                time_elem = article.find('time')
+                if time_elem:
+                    # Get the readable date text
+                    date = time_elem.get_text(strip=True)
+                else:
+                    date = "Unknown"
+                
+                # Extract comment content from the comment-content div
+                content_div = article.find('div', class_='comment-content')
+                if not content_div:
+                    continue
+                
+                # Get clean comment text (remove extra whitespace)
+                comment_text = content_div.get_text(separator=' ', strip=True)
+                
+                # Skip if comment is too short or contains form elements
+                if (not comment_text or len(comment_text.strip()) < 5 or
+                    any(skip in comment_text.lower() for skip in [
+                        'leave a reply', 'cancel reply', 'comment:', 'your email'
+                    ])):
+                    continue
+                
+                # Determine if this is a reply (nested in ul.children)
+                is_reply = bool(comment_item.find_parent('ul', class_='children'))
+                
+                comment_data = {
+                    'text': comment_text,
+                    'author': author,
+                    'date': date,
+                    'length': len(comment_text),
+                    'type': 'reply' if is_reply else 'comment',
+                    'comment_id': comment_id
+                }
+                
+                # Check for duplicates based on comment ID or text
+                if not any(c.get('comment_id') == comment_id or 
+                          c['text'] == comment_text for c in comments):
+                    comments.append(comment_data)
+                    logger.debug(f"Extracted {'reply' if is_reply else 'comment'} "
+                               f"by {author}: {comment_text[:50]}...")
+                    
+            except Exception as e:
+                logger.debug(f"Error extracting comment: {e}")
+                continue
         
+        if not comments:
+            return [{
+                'text': f'No comments extracted (Comment count: {comment_count})',
+                'author': 'System',
+                'date': 'N/A', 
+                'length': 0,
+                'type': 'metadata'
+            }]
+        
+        logger.info(f"Successfully extracted {len(comments)} comments/replies")
         return comments
     
     def _get_comment_count(self, soup: BeautifulSoup) -> int:
-        """Get comment count from page metadata"""
-        # Look for comment count in the post meta
-        comment_meta = soup.select_one('.td-post-comments a, [class*="comment"] i + *')
+        """Get comment count from NRI NOW specific structure"""
+        # Method 1: Look for comment count in the comments title
+        comments_title = soup.find('h4', class_='td-comments-title')
+        if comments_title:
+            title_text = comments_title.get_text(strip=True)
+            # Extract number from text like "5 COMMENTS"
+            import re
+            numbers = re.findall(r'\d+', title_text)
+            if numbers:
+                return int(numbers[0])
+        
+        # Method 2: Count actual comment items in the list
+        comments_section = soup.find('div', {'class': 'comments', 
+                                           'id': 'comments'})
+        if comments_section:
+            comment_list = comments_section.find('ol', class_='comment-list')
+            if comment_list:
+                # Count all li elements with class 'comment'
+                comment_items = comment_list.find_all('li', class_='comment', 
+                                                    recursive=True)
+                return len(comment_items)
+        
+        # Method 3: Fallback to generic meta search
+        comment_meta = soup.select_one('.td-post-comments a, '
+                                     '[class*="comment"] i + *')
         if comment_meta:
             text = comment_meta.get_text(strip=True)
             try:
-                # Extract number from text like "0", "5 comments", etc.
                 import re
                 numbers = re.findall(r'\d+', text)
                 if numbers:
@@ -551,29 +642,44 @@ class StealthScraper:
             logger.error(f"Content extraction error: {e}")
             return {'url': url, 'success': False, 'error': str(e)}
     
-    def search_articles(self, keyword: str, max_articles: int = 10, max_pages: int = 3) -> List[Dict]:
+    def search_articles(self, keyword: str, max_articles: int = 10, max_pages: int = 15) -> List[Dict]:
         """
         Search for articles by keyword using NRI NOW search endpoint with pagination
+        
+        Each page typically contains 7 results. Popular search terms may have 
+        10+ pages of results. Pagination follows the pattern:
+        - Page 1: https://www.nrinow.news/?s=keyword
+        - Page 2+: https://www.nrinow.news/page/{page_num}/?s=keyword
         
         Args:
             keyword: Search term
             max_articles: Maximum number of articles to scrape from search results
-            max_pages: Maximum number of search result pages to check
+            max_pages: Maximum number of search result pages to check 
+                      (default: 15, popular terms like 'Brian Newberry' have 11+ pages)
             
         Returns:
             List of article data dictionaries
         """
-        logger.info(f"Searching for keyword: '{keyword}' (max {max_articles} articles, {max_pages} pages)")
+        logger.info(f"Searching for keyword: '{keyword}' "
+                   f"(max {max_articles} articles, {max_pages} pages)")
+        logger.info(f"Expected results: ~{max_pages * 7} total results "
+                   f"available across {max_pages} pages")
+        
+        # URL encode the search term for proper handling of spaces and 
+        # special characters
+        from urllib.parse import quote_plus
+        encoded_keyword = quote_plus(keyword)
         
         all_article_urls = []
         page_num = 1
         
-        # Search through multiple pages
+        # Search through multiple pages (each page has ~7 results)
         while len(all_article_urls) < max_articles and page_num <= max_pages:
             if page_num == 1:
-                search_url = f"https://www.nrinow.news/?s={keyword}"
+                search_url = f"https://www.nrinow.news/?s={encoded_keyword}"
             else:
-                search_url = f"https://www.nrinow.news/page/{page_num}/?s={keyword}"
+                search_url = (f"https://www.nrinow.news/page/{page_num}/"
+                             f"?s={encoded_keyword}")
             
             logger.info(f"Checking search page {page_num}: {search_url}")
             
@@ -587,27 +693,110 @@ class StealthScraper:
             soup = BeautifulSoup(page_source, 'html.parser')
             page_article_urls = []
             
-            # Find article links in search results
-            for link in soup.find_all('a', href=True):
-                href = link['href']
-                if (href.startswith('https://www.nrinow.news/') and 
-                    '/2025/' in href and 
-                    href not in all_article_urls and
-                    not href.endswith('#comments') and
-                    not href.endswith('#respond')):
-                    page_article_urls.append(href)
+            # Find main content area (skip navigation and menu links)
+            main_content = soup.find('div', class_='td-main-content-wrap')
+            if not main_content:
+                logger.warning(f"Could not find main content area on page "
+                             f"{page_num}")
+                # Fallback to full page if main content not found
+                main_content = soup
+            
+            # Method 1: Look for article title links (primary method)
+            # These are in <h3 class="entry-title td-module-title">
+            title_links = main_content.find_all('h3', class_='entry-title')
+            for title_element in title_links:
+                link = title_element.find('a', href=True)
+                if link:
+                    href = link['href']
+                    if (href.startswith('https://www.nrinow.news/') and
+                        '/202' in href and  # Matches 2020-2029
+                        '/page/' not in href and  # Skip pagination links
+                        href not in page_article_urls and  # No page dupes
+                        href not in all_article_urls and  # No global dupes
+                        not href.endswith('#comments') and
+                        not href.endswith('#respond')):
+                        page_article_urls.append(href)
+                        logger.debug(f"Found article via title link: {href}")
+            
+            # Method 2: Fallback - look for all article links if no titles
+            if not page_article_urls:
+                logger.debug("No title links found, using fallback method")
+                for link in main_content.find_all('a', href=True):
+                    href = link['href']
+                    # Look for article URLs (any year, not just 2025)
+                    if (href.startswith('https://www.nrinow.news/') and
+                        '/202' in href and  # Matches 2020-2029
+                        '/page/' not in href and  # Skip pagination links
+                        href not in page_article_urls and  # No page dupes
+                        href not in all_article_urls and  # No global dupes
+                        not href.endswith('#comments') and
+                        not href.endswith('#respond')):
+                        page_article_urls.append(href)
+                        logger.debug(f"Found article via fallback: {href}")
             
             if not page_article_urls:
-                logger.info(f"No more articles found on page {page_num}, stopping pagination")
+                logger.info(f"No more articles found on page {page_num}, "
+                           f"stopping pagination")
                 break
             
             all_article_urls.extend(page_article_urls)
-            logger.info(f"Found {len(page_article_urls)} articles on page {page_num} (total: {len(all_article_urls)})")
+            logger.info(f"Found {len(page_article_urls)} articles on page "
+                       f"{page_num} (total: {len(all_article_urls)})")
             
-            # Check if there's a next page
-            next_page_link = soup.find('a', string='Next')
-            if not next_page_link:
-                logger.info("No 'Next' page link found, stopping pagination")
+            # Check if there's a next page using multiple methods
+            has_next_page = False
+            
+            # Method 1: Look for pagination navigation
+            pagination_nav = soup.find('div', class_='page-nav')
+            if pagination_nav:
+                # Look for "Page X of Y" to get total pages
+                pages_span = pagination_nav.find('span', class_='pages')
+                if pages_span:
+                    pages_text = pages_span.get_text()
+                    # Extract "Page 2 of 11" pattern
+                    if 'Page' in pages_text and 'of' in pages_text:
+                        try:
+                            parts = pages_text.split()
+                            current_page = int(parts[1])
+                            total_pages = int(parts[3])
+                            if current_page < total_pages:
+                                has_next_page = True
+                                logger.debug(f"Found pagination: {pages_text} - more pages available")
+                            else:
+                                logger.debug(f"Found pagination: {pages_text} - on last page")
+                        except (ValueError, IndexError):
+                            pass
+                
+                # Also look for next page link in pagination
+                next_page_link = pagination_nav.find('a', href=True)
+                if next_page_link and f'/page/{page_num + 1}/' in next_page_link.get('href', ''):
+                    has_next_page = True
+                    logger.debug(f"Found next page link: {next_page_link.get('href')}")
+            
+            # Method 2: Look for numerical pagination links (fallback)
+            if not has_next_page:
+                page_links = soup.find_all('a', href=True)
+                for link in page_links:
+                    href = link.get('href', '')
+                    if f'/page/{page_num + 1}/' in href and '?s=' in href:
+                        has_next_page = True
+                        logger.debug(f"Found next page link: {href}")
+                        break
+            
+            # Method 3: Check if we got fewer results than expected (indicates last page)
+            if not has_next_page and len(page_article_urls) < 7:
+                logger.info(f"Got {len(page_article_urls)} results (< 7), "
+                           f"likely last page")
+            
+            # Method 4: If we're not at max pages and got full results, assume more pages exist
+            if (not has_next_page and len(page_article_urls) >= 7 
+                and page_num < max_pages):
+                logger.info(f"Got {len(page_article_urls)} results, "
+                           f"assuming more pages exist")
+                has_next_page = True
+            
+            if not has_next_page:
+                logger.info(f"No more pages detected after page {page_num}")
                 break
             
             page_num += 1
@@ -622,12 +811,14 @@ class StealthScraper:
         
         # Limit to requested number
         article_urls_to_scrape = all_article_urls[:max_articles]
-        logger.info(f"Found {len(all_article_urls)} total search results, scraping {len(article_urls_to_scrape)} articles")
+        logger.info(f"Found {len(all_article_urls)} total search results, "
+                   f"scraping {len(article_urls_to_scrape)} articles")
         
         # Scrape each article
         results = []
         for i, url in enumerate(article_urls_to_scrape, 1):
-            print(f"Scraping search result {i}/{len(article_urls_to_scrape)}: {url[:80]}...")
+            print(f"Scraping search result {i}/{len(article_urls_to_scrape)}: "
+                  f"{url[:80]}...")
             
             # Random delay between articles
             if i > 1:
@@ -701,10 +892,27 @@ def main():
                        help='Maximum number of articles to scrape')
     parser.add_argument('--search', type=str,
                        help='Search for articles containing this keyword')
-    parser.add_argument('--max-pages', type=int, default=3,
-                       help='Maximum search result pages to check (default: 3)')
+    parser.add_argument('--url', type=str,
+                       help='Scrape a specific article URL directly')
+    parser.add_argument('--output-dir', type=str, default='.',
+                       help='Directory to save results (default: current directory)')
+    parser.add_argument('--separate-files', action='store_true',
+                       help='Save each article as a separate JSON file')
+    parser.add_argument('--max-pages', type=int, default=15,
+                       help='Maximum search result pages to check (default: 15)')
     
     args = parser.parse_args()
+    
+    # Validate arguments
+    if args.url and args.search:
+        print("Error: Cannot use both --url and --search options together.")
+        print("Use --url for a specific article or --search for keyword search.")
+        return
+    
+    if args.url and not args.url.startswith('https://www.nrinow.news/'):
+        print("Error: URL must be from nrinow.news domain")
+        print(f"Provided: {args.url}")
+        return
     
     # Determine mode
     if args.headless:
@@ -722,33 +930,107 @@ def main():
     print(f"Mode: {mode_text}")
     if args.search:
         print(f"Search: '{args.search}'")
+    elif args.url:
+        print(f"URL: {args.url}")
     
     try:
-        with StealthScraper(headless=args.headless, minimized=args.minimized) as scraper:
+        with StealthScraper(headless=args.headless, 
+                           minimized=args.minimized) as scraper:
             # Choose scraping method
-            if args.search:
+            if args.url:
+                # Scrape single URL directly
+                print(f"Scraping single URL: {args.url}")
+                result = scraper.extract_article(args.url)
+                results = [result]
+                operation = "single_url"
+            elif args.search:
                 results = scraper.search_articles(
-                    args.search, 
+                    args.search,
                     max_articles=args.max_articles,
                     max_pages=args.max_pages
                 )
                 operation = f"search_{args.search.replace(' ', '_')}"
             else:
-                results = scraper.scrape_articles(max_articles=args.max_articles)
+                results = scraper.scrape_articles(
+                    max_articles=args.max_articles)
                 operation = "latest"
             
             # Save results
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"stealth_results_{operation}_{mode_file}_{timestamp}.json"
             
-            with open(filename, 'w') as f:
-                json.dump(results, f, indent=2)
+            # Create output directory if it doesn't exist
+            import os
+            output_dir = args.output_dir
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                print(f"Created output directory: {output_dir}")
+            
+            if args.separate_files:
+                # Save each article as a separate file
+                saved_files = []
+                for i, result in enumerate(results, 1):
+                    if result.get('success', False):
+                        # Create a safe filename from the title
+                        title = result.get('title', 'untitled')
+                        
+                        # Extract first few meaningful words from title
+                        words = title.split()
+                        # Take first 3-4 words, filter out common short words
+                        meaningful_words = []
+                        for word in words[:6]:  # Look at first 6 words
+                            clean_word = "".join(c for c in word
+                                                 if c.isalnum())
+                            skip_words = ['the', 'and', 'for', 'with', 'from']
+                            if (len(clean_word) > 2 and
+                                    clean_word.lower() not in skip_words):
+                                meaningful_words.append(clean_word)
+                            # Stop at 3 meaningful words
+                            if len(meaningful_words) >= 3:
+                                break
+                        
+                        # Join with underscores and limit total length
+                        safe_title = "_".join(meaningful_words)[:30]
+                        if not safe_title:
+                            safe_title = "article"
+                        
+                        # Format: Title_YYYYMMDD_###.json using publish date
+                        publish_date = result.get('publish_date', 'Unknown')
+                        date_part = parse_publish_date(publish_date)
+                        if not date_part:
+                            # Fallback to current date if parsing fails
+                            date_part = timestamp[:8]
+                        
+                        article_filename = (f"{safe_title}_{date_part}_"
+                                            f"{i:03d}.json")
+                        article_path = os.path.join(output_dir,
+                                                    article_filename)
+                        
+                        with open(article_path, 'w', encoding='utf-8') as f:
+                            json.dump(result, f, indent=2, ensure_ascii=False)
+                        saved_files.append(article_filename)
+                        
+                print(f"Saved {len(saved_files)} individual article files "
+                      f"to: {output_dir}")
+                for filename in saved_files[:5]:  # Show first 5 files
+                    print(f"  - {filename}")
+                if len(saved_files) > 5:
+                    print(f"  ... and {len(saved_files) - 5} more files")
+            else:
+                # Save all articles in one file (original behavior)
+                filename = (f"stealth_results_{operation}_{mode_file}_"
+                            f"{timestamp}.json")
+                filepath = os.path.join(output_dir, filename)
+                
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, indent=2, ensure_ascii=False)
+                
+                print(f"Results saved to: {filepath}")
             
             # Summary
             successful = sum(1 for r in results if r['success'])
             print("\n" + "=" * 40)
-            print(f"STEALTH SUMMARY: {successful}/{len(results)} articles scraped")
-            print(f"Results saved to: {filename}")
+            print(f"STEALTH SUMMARY: {successful}/{len(results)} articles "
+                  f"scraped")
             
             for i, result in enumerate(results, 1):
                 if result.get('success', False):
@@ -760,7 +1042,8 @@ def main():
                         total_info = ""
                         if 'total_search_results' in result:
                             total_info = f"/{result['total_search_results']}"
-                        search_info = f" (Rank #{result['search_rank']}{total_info}{pages_info})"
+                        search_info = (f" (Rank #{result['search_rank']}"
+                                       f"{total_info}{pages_info})")
                     print(f"\n{i}. ✅ {result['title'][:60]}...{search_info}")
                     print(f"   Author: {result['author']}")
                     print(f"   Date: {result['publish_date']}")

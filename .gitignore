@@ -48,6 +48,10 @@ venv
 # Ruff cache
 .ruff_cache
 
+# Debug and test files
+debug_page_*.html
+stealth_results_*.json
+
 
 # Local debug
 _docs
